@@ -1,0 +1,4 @@
+CompileFlags:
+  Remove: [-mlongcalls, -fstrict-volatile-bitfields, -fno-tree-switch-conversion, -mtext-section-literals]
+  Add: [--target=xtensa, -DARDUINO=10812]
+  CompilationDatabase: .
