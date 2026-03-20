@@ -6,19 +6,25 @@
 |------|------------|-----------------------------|-----------|---------------------------------|
 | 21   | DISP_SDA   | I2C display SDA             | I/O       | Default I2C SDA, internal pullup|
 | 22   | DISP_SCL   | I2C display SCL             | Output    | Default I2C SCL, internal pullup|
+||
 | 4    | BUTTON     | Red push button             | Input     | Internal pullup, active LOW     |
+|
 | 16   | ENC1_A     | Encoder 1 — channel A (CLK) | Input     | Internal pullup, interrupt      |
 | 17   | ENC1_B     | Encoder 1 — channel B (DT)  | Input     | Internal pullup, interrupt      |
 | 5    | ENC1_SW    | Encoder 1 — push switch     | Input     | Internal pullup, active LOW     |
+|
 | 18   | ENC2_A     | Encoder 2 — channel A (CLK) | Input     | Internal pullup, interrupt      |
 | 19   | ENC2_B     | Encoder 2 — channel B (DT)  | Input     | Internal pullup, interrupt      |
 | 13   | ENC2_SW    | Encoder 2 — push switch     | Input     | Internal pullup, active LOW     |
+|
 | 25   | ENC3_A     | Encoder 3 — channel A (CLK) | Input     | Internal pullup, interrupt      |
 | 26   | ENC3_B     | Encoder 3 — channel B (DT)  | Input     | Internal pullup, interrupt      |
 | 27   | ENC3_SW    | Encoder 3 — push switch     | Input     | Internal pullup, active LOW     |
+|
 | 32   | ENC4_A     | Encoder 4 — channel A (CLK) | Input     | Internal pullup, interrupt      |
 | 33   | ENC4_B     | Encoder 4 — channel B (DT)  | Input     | Internal pullup, interrupt      |
 | 23   | ENC4_SW    | Encoder 4 — push switch     | Input     | Internal pullup, active LOW     |
+|
 | 14   | ENC5_A     | Encoder 5 — channel A (CLK) | Input     | Internal pullup, interrupt      |
 | 15   | ENC5_B     | Encoder 5 — channel B (DT)  | Input     | Internal pullup, interrupt      |
 | 2    | ENC5_SW    | Encoder 5 — push switch     | Input     | Internal pullup, on-board LED   |
