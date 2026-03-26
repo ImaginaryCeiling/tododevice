@@ -27,7 +27,7 @@
 |
 | 14   | ENC5_A     | Encoder 5 — channel A (CLK) | Input     | Internal pullup, interrupt      |
 | 15   | ENC5_B     | Encoder 5 — channel B (DT)  | Input     | Internal pullup, interrupt      |
-| 2    | ENC5_SW    | Encoder 5 — push switch     | Input     | Internal pullup, on-board LED   |
+| 34   | ENC5_SW    | Encoder 5 — push switch     | Input     | Input-only, external 10K pullup |
 
 ## Peripherals
 
@@ -39,7 +39,7 @@
 | Rotary Encoder 2   | EC11 (360° + push)       | GPIO + ISR | 18, 19, 13      |
 | Rotary Encoder 3   | EC11 (360° + push)       | GPIO + ISR | 25, 26, 27      |
 | Rotary Encoder 4   | EC11 (360° + push)       | GPIO + ISR | 32, 33, 23      |
-| Rotary Encoder 5   | EC11 (360° + push)       | GPIO + ISR | 14, 15, 2       |
+| Rotary Encoder 5   | EC11 (360° + push)       | GPIO + ISR | 14, 15, 34      |
 
 ## Wiring Reference
 
@@ -86,12 +86,12 @@ Each side pair is internally shorted. Wire one pin from each side:
 | Red Button       | 1     |
 | Encoders (5 × 3) | 15   |
 | **Total used**   | **18**|
-| Remaining safe   | 0     |
-| Input-only spare | 4 (GPIOs 34, 35, 36, 39 — no internal pullup) |
+| Remaining safe   | 1 (GPIO 2 — on-board LED) |
+| Input-only spare | 3 (GPIOs 35, 36, 39 — no internal pullup) |
 
 ## Notes
 
-- **GPIO 2** (ENC5_SW): doubles as the on-board LED — LED will flicker when the encoder is pressed, which is harmless.
+- **GPIO 34** (ENC5_SW): input-only pin with no internal pullup — requires an external 10K resistor to 3.3V.
 - **GPIO 14**: outputs a brief PWM pulse during boot — no effect on encoder reading since the encoder is passive.
 - **GPIO 15**: outputs a brief PWM pulse during boot and controls boot debug logging — same as above, no issue for encoder input.
 - All encoder and button pins use `INPUT_PULLUP` so no external pull-up resistors are needed.
