@@ -12,7 +12,7 @@
 
 const uint8_t encPinA[NUM_ENCODERS]  = {16, 18, 25, 32, 14};
 const uint8_t encPinB[NUM_ENCODERS]  = {17, 19, 26, 33, 15};
-const uint8_t encPinSW[NUM_ENCODERS] = { 5, 13, 27, 23,  2};
+const uint8_t encPinSW[NUM_ENCODERS] = { 5, 13, 27, 23, 34};
 
 Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
@@ -106,16 +106,15 @@ void setup() {
 void loop() {
   bool buttonState = digitalRead(BUTTON_PIN);
   if (lastButtonState == HIGH && buttonState == LOW) {
-    activeEncoder = (activeEncoder + 1) % NUM_ENCODERS;
-    Serial.print("Switched to encoder ");
-    Serial.println(activeEncoder + 1);
+    activeEncoder = (activeEncoder + 1) % (NUM_ENCODERS + 1);
+    if (activeEncoder == NUM_ENCODERS)
+      Serial.println("Switched to ALL mode");
+    else {
+      Serial.print("Switched to encoder ");
+      Serial.println(activeEncoder + 1);
+    }
   }
   lastButtonState = buttonState;
-
-  int i = activeEncoder;
-  long pos = encPos[i];
-  bool swPressed = digitalRead(encPinSW[i]) == LOW;
-  bool connected = isEncoderConnected(i);
 
   oled.clearDisplay();
   oled.setTextSize(1);
@@ -129,30 +128,52 @@ void loop() {
     oled.print(e + 1);
     if (e < NUM_ENCODERS - 1) oled.print(" ");
   }
+  if (activeEncoder == NUM_ENCODERS)
+    oled.print(" >A");
+  else
+    oled.print("  A");
 
-  oled.setCursor(0, 14);
-  oled.print("Encoder ");
-  oled.print(i + 1);
-
-  if (!connected) {
-    oled.setTextSize(1);
-    oled.setCursor(0, 30);
-    oled.print("No encoder connected");
+  if (activeEncoder == NUM_ENCODERS) {
+    for (int e = 0; e < NUM_ENCODERS; e++) {
+      oled.setCursor(0, 12 + e * 10);
+      oled.print(e + 1);
+      oled.print(": ");
+      if (!isEncoderConnected(e)) {
+        oled.print("--");
+      } else {
+        oled.print(encPos[e]);
+        if (digitalRead(encPinSW[e]) == LOW)
+          oled.print(" SW");
+      }
+    }
   } else {
-    oled.setCursor(0, 26);
-    oled.print("Pos: ");
-    oled.setTextSize(2);
-    oled.print(pos);
+    int i = activeEncoder;
+    long pos = encPos[i];
+    bool swPressed = digitalRead(encPinSW[i]) == LOW;
+    bool connected = isEncoderConnected(i);
 
-    oled.setTextSize(1);
-    oled.setCursor(0, 46);
-    oled.print("Knob: ");
-    oled.print(swPressed ? "PRESSED" : "---");
+    oled.setCursor(0, 14);
+    oled.print("Encoder ");
+    oled.print(i + 1);
+
+    if (!connected) {
+      oled.setCursor(0, 30);
+      oled.print("No encoder connected");
+    } else {
+      oled.setCursor(0, 26);
+      oled.print("Pos: ");
+      oled.setTextSize(2);
+      oled.print(pos);
+
+      oled.setTextSize(1);
+      oled.setCursor(0, 46);
+      oled.print("Knob: ");
+      oled.print(swPressed ? "PRESSED" : "---");
+    }
+
+    oled.setCursor(0, 57);
+    oled.print("Red btn to switch");
   }
-
-  oled.setCursor(0, 57);
-  oled.setTextSize(1);
-  oled.print("Red btn to switch");
 
   oled.display();
   delay(30);
