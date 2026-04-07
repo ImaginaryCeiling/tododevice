@@ -1,180 +1,264 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Preferences.h>
+#include "config.h"
+#include "encoders.h"
+#include "display.h"
+#include "network.h"
+#include "linear.h"
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_ADDR 0x3C
+// ---------------------------------------------------------------------------
+// State machine
+// ---------------------------------------------------------------------------
 
-#define BUTTON_PIN 4
-#define NUM_ENCODERS 5
+enum AppState {
+  STATE_BOOT,
+  STATE_IDLE,
+  STATE_CONFIGURING,
+  STATE_SUBMITTING,
+  STATE_RESULT
+};
 
-const uint8_t encPinA[NUM_ENCODERS]  = {16, 18, 25, 32, 14};
-const uint8_t encPinB[NUM_ENCODERS]  = {17, 19, 26, 33, 15};
-const uint8_t encPinSW[NUM_ENCODERS] = { 5, 13, 27, 23, 34};
+static AppState      state     = STATE_BOOT;
+static AppState      prevState = STATE_BOOT;
+static LinearData    linearData;
+static Preferences   prefs;
+static uint32_t      issueNum;
+static bool          lastResultOk;
+static String        resultMsg;
+static unsigned long resultTime;
 
-Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+// ---------------------------------------------------------------------------
+// Priority lookup (hardcoded — Linear uses ints 0-4)
+// ---------------------------------------------------------------------------
 
-volatile long encPos[NUM_ENCODERS] = {};
-volatile uint8_t encLast[NUM_ENCODERS] = {};
+static const char* PRIO_NAMES[] = {"None", "Urgent", "High", "Medium", "Low"};
+static const int   PRIO_VALS[]  = { 0,      1,        2,      3,        4    };
+static const int   NUM_PRIOS    = 5;
 
-static void IRAM_ATTR encISR0() {
-  uint8_t enc = (digitalRead(encPinA[0]) << 1) | digitalRead(encPinB[0]);
-  uint8_t s = (encLast[0] << 2) | enc;
-  if (s == 0b1101 || s == 0b0100 || s == 0b0010 || s == 0b1011) encPos[0]++;
-  if (s == 0b1110 || s == 0b0111 || s == 0b0001 || s == 0b1000) encPos[0]--;
-  encLast[0] = enc;
+// ---------------------------------------------------------------------------
+// Button debounce
+// ---------------------------------------------------------------------------
+
+static bool          rawBtn       = HIGH;
+static bool          stableBtn    = HIGH;
+static unsigned long btnChangeAt  = 0;
+static bool          btnPressed   = false;
+static bool          btnLongPress = false;
+static unsigned long btnDownAt    = 0;
+static const unsigned long LONG_PRESS_MS = 2000;
+
+static void readButton() {
+  btnPressed = false;
+  btnLongPress = false;
+  bool reading = digitalRead(BUTTON_PIN);
+
+  if (reading != rawBtn) {
+    btnChangeAt = millis();
+    rawBtn = reading;
+  }
+
+  if ((millis() - btnChangeAt) > DEBOUNCE_MS && rawBtn != stableBtn) {
+    if (rawBtn == LOW) {
+      btnDownAt = millis();
+    } else {
+      if ((millis() - btnDownAt) < LONG_PRESS_MS) {
+        btnPressed = true;
+      }
+    }
+    stableBtn = rawBtn;
+  }
+
+  if (stableBtn == LOW && btnDownAt > 0 && (millis() - btnDownAt) >= LONG_PRESS_MS) {
+    btnLongPress = true;
+    btnDownAt = 0;
+  }
 }
-static void IRAM_ATTR encISR1() {
-  uint8_t enc = (digitalRead(encPinA[1]) << 1) | digitalRead(encPinB[1]);
-  uint8_t s = (encLast[1] << 2) | enc;
-  if (s == 0b1101 || s == 0b0100 || s == 0b0010 || s == 0b1011) encPos[1]++;
-  if (s == 0b1110 || s == 0b0111 || s == 0b0001 || s == 0b1000) encPos[1]--;
-  encLast[1] = enc;
-}
-static void IRAM_ATTR encISR2() {
-  uint8_t enc = (digitalRead(encPinA[2]) << 1) | digitalRead(encPinB[2]);
-  uint8_t s = (encLast[2] << 2) | enc;
-  if (s == 0b1101 || s == 0b0100 || s == 0b0010 || s == 0b1011) encPos[2]++;
-  if (s == 0b1110 || s == 0b0111 || s == 0b0001 || s == 0b1000) encPos[2]--;
-  encLast[2] = enc;
-}
-static void IRAM_ATTR encISR3() {
-  uint8_t enc = (digitalRead(encPinA[3]) << 1) | digitalRead(encPinB[3]);
-  uint8_t s = (encLast[3] << 2) | enc;
-  if (s == 0b1101 || s == 0b0100 || s == 0b0010 || s == 0b1011) encPos[3]++;
-  if (s == 0b1110 || s == 0b0111 || s == 0b0001 || s == 0b1000) encPos[3]--;
-  encLast[3] = enc;
-}
-static void IRAM_ATTR encISR4() {
-  uint8_t enc = (digitalRead(encPinA[4]) << 1) | digitalRead(encPinB[4]);
-  uint8_t s = (encLast[4] << 2) | enc;
-  if (s == 0b1101 || s == 0b0100 || s == 0b0010 || s == 0b1011) encPos[4]++;
-  if (s == 0b1110 || s == 0b0111 || s == 0b0001 || s == 0b1000) encPos[4]--;
-  encLast[4] = enc;
+
+// Encoder switch debounce (push-to-reset)
+static bool encSwLast[NUM_ENCODERS] = {false};
+
+static void checkEncoderSwitches() {
+  for (int i = 0; i < NUM_ENCODERS; i++) {
+    bool pressed = encoderSwitch(i);
+    if (pressed && !encSwLast[i]) {
+      encoderReset(i);
+      Serial.printf("Encoder %d reset\n", i + 1);
+    }
+    encSwLast[i] = pressed;
+  }
 }
 
-void (*encISRs[NUM_ENCODERS])() = {encISR0, encISR1, encISR2, encISR3, encISR4};
+// ---------------------------------------------------------------------------
+// Config screen — track previous indices to avoid flicker
+// ---------------------------------------------------------------------------
 
-int activeEncoder = 0;
-bool lastButtonState = HIGH;
+static int prevIdx[5] = {-1, -1, -1, -1, -1};
 
-bool isEncoderConnected(int i) {
-  int a = digitalRead(encPinA[i]);
-  int b = digitalRead(encPinB[i]);
-  int sw = digitalRead(encPinSW[i]);
-  // Unconnected pins with pullup all read HIGH and position stays 0.
-  // If any pin reads LOW, or position has moved, it's connected.
-  if (a == LOW || b == LOW || sw == LOW) return true;
-  if (encPos[i] != 0) return true;
-  return false;
+static void resetPrevIdx() {
+  for (int i = 0; i < 5; i++) prevIdx[i] = -1;
 }
+
+// ---------------------------------------------------------------------------
+// setup
+// ---------------------------------------------------------------------------
 
 void setup() {
   Serial.begin(115200);
 
+  displaySetup();
+  encodersSetup();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  for (int i = 0; i < NUM_ENCODERS; i++) {
-    pinMode(encPinA[i], INPUT_PULLUP);
-    pinMode(encPinB[i], INPUT_PULLUP);
-    pinMode(encPinSW[i], INPUT_PULLUP);
-    encLast[i] = (digitalRead(encPinA[i]) << 1) | digitalRead(encPinB[i]);
-    attachInterrupt(digitalPinToInterrupt(encPinA[i]), encISRs[i], CHANGE);
-    attachInterrupt(digitalPinToInterrupt(encPinB[i]), encISRs[i], CHANGE);
+  // --- WiFi ---
+  displayBoot("Connecting", "WiFi...");
+  networkSetup();
+
+  if (!networkConnected()) {
+    displayResult(false, "WiFi failed");
+    delay(3000);
+    ESP.restart();
   }
 
-  Wire.begin(21, 22);
+  // --- Fetch Linear data (up to 3 attempts) ---
+  displayBoot("Fetching", "Linear data...");
 
-  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("SSD1306 not found");
-    while (true) delay(1000);
+  bool fetched = false;
+  for (int i = 0; i < 3 && !fetched; i++) {
+    fetched = linearFetchData(linearData);
+    if (!fetched) delay(1000);
   }
 
-  oled.clearDisplay();
-  oled.setTextSize(2);
-  oled.setTextColor(SSD1306_WHITE);
-  oled.setCursor(0, 0);
-  oled.println("Encoder");
-  oled.println("Tester");
-  oled.display();
-  Serial.println("Encoder tester ready");
-  delay(1000);
+  if (!fetched) {
+    displayResult(false, "Linear fetch fail");
+    delay(3000);
+    ESP.restart();
+  }
+
+  Serial.printf("Team: %s | states:%d members:%d projects:%d labels:%d\n",
+    linearData.teamName.c_str(),
+    linearData.states.size(), linearData.members.size(),
+    linearData.projects.size(), linearData.labels.size());
+
+  // --- Issue counter (persisted in NVS) ---
+  prefs.begin("tododevice", false);
+  issueNum = prefs.getUInt("issueNum", 1);
+
+  state = STATE_IDLE;
+  Serial.println("-> IDLE");
 }
 
+// ---------------------------------------------------------------------------
+// loop
+// ---------------------------------------------------------------------------
+
 void loop() {
-  bool buttonState = digitalRead(BUTTON_PIN);
-  if (lastButtonState == HIGH && buttonState == LOW) {
-    activeEncoder = (activeEncoder + 1) % (NUM_ENCODERS + 1);
-    if (activeEncoder == NUM_ENCODERS)
-      Serial.println("Switched to ALL mode");
-    else {
-      Serial.print("Switched to encoder ");
-      Serial.println(activeEncoder + 1);
-    }
-  }
-  lastButtonState = buttonState;
+  readButton();
 
-  oled.clearDisplay();
-  oled.setTextSize(1);
-  oled.setCursor(0, 0);
+  bool stateChanged = (state != prevState);
+  prevState = state;
 
-  for (int e = 0; e < NUM_ENCODERS; e++) {
-    if (e == activeEncoder)
-      oled.print(">");
-    else
-      oled.print(" ");
-    oled.print(e + 1);
-    if (e < NUM_ENCODERS - 1) oled.print(" ");
-  }
-  if (activeEncoder == NUM_ENCODERS)
-    oled.print(" >A");
-  else
-    oled.print("  A");
+  switch (state) {
 
-  if (activeEncoder == NUM_ENCODERS) {
-    for (int e = 0; e < NUM_ENCODERS; e++) {
-      oled.setCursor(0, 12 + e * 10);
-      oled.print(e + 1);
-      oled.print(": ");
-      if (!isEncoderConnected(e)) {
-        oled.print("--");
-      } else {
-        oled.print(encPos[e]);
-        if (digitalRead(encPinSW[e]) == LOW)
-          oled.print(" SW");
+    // ---- IDLE ----
+    case STATE_IDLE:
+      if (stateChanged) {
+        displayIdle(issueNum, linearData.teamName.c_str());
       }
+      if (btnPressed) {
+        state = STATE_CONFIGURING;
+        Serial.println("-> CONFIGURING");
+      }
+      if (btnLongPress) {
+        displayBoot("Refreshing", "Linear data...");
+        if (linearFetchData(linearData)) {
+          Serial.println("Linear data refreshed");
+        } else {
+          displayResult(false, "Refresh failed");
+          delay(2000);
+        }
+        displayIdle(issueNum, linearData.teamName.c_str());
+      }
+      break;
+
+    // ---- CONFIGURING ----
+    case STATE_CONFIGURING: {
+      checkEncoderSwitches();
+
+      int idx[5] = {
+        encoderIndex(0, linearData.states.size()),
+        encoderIndex(1, NUM_PRIOS),
+        encoderIndex(2, linearData.members.size()),
+        encoderIndex(3, linearData.projects.size()),
+        encoderIndex(4, linearData.labels.size())
+      };
+
+      if (stateChanged) {
+        displayConfigBegin(issueNum);
+        resetPrevIdx();
+      }
+
+      // Only redraw fields that changed
+      const char* vals[5] = {
+        linearData.states[idx[0]].name.c_str(),
+        PRIO_NAMES[idx[1]],
+        linearData.members[idx[2]].name.c_str(),
+        linearData.projects[idx[3]].name.c_str(),
+        linearData.labels[idx[4]].name.c_str()
+      };
+
+      for (int f = 0; f < 5; f++) {
+        if (idx[f] != prevIdx[f]) {
+          displayConfigValue(f, vals[f]);
+          prevIdx[f] = idx[f];
+        }
+      }
+
+      if (btnPressed) {
+        displaySubmitting();
+
+        IssueParams p;
+        p.teamId     = linearData.teamId;
+        p.title      = "Device Issue #" + String(issueNum);
+        p.stateId    = linearData.states[idx[0]].id;
+        p.priority   = PRIO_VALS[idx[1]];
+        p.assigneeId = linearData.members[idx[2]].id;
+        p.projectId  = linearData.projects[idx[3]].id;
+        p.labelId    = linearData.labels[idx[4]].id;
+
+        IssueResult res = linearCreateIssue(p);
+
+        lastResultOk = res.success;
+        if (res.success) {
+          resultMsg = res.identifier;
+          issueNum++;
+          prefs.putUInt("issueNum", issueNum);
+          Serial.printf("Created: %s\n", res.identifier.c_str());
+        } else {
+          resultMsg = res.error;
+          Serial.printf("Error: %s\n", res.error.c_str());
+        }
+
+        resultTime = millis();
+        state = STATE_RESULT;
+        Serial.println("-> RESULT");
+      }
+      break;
     }
-  } else {
-    int i = activeEncoder;
-    long pos = encPos[i];
-    bool swPressed = digitalRead(encPinSW[i]) == LOW;
-    bool connected = isEncoderConnected(i);
 
-    oled.setCursor(0, 14);
-    oled.print("Encoder ");
-    oled.print(i + 1);
+    // ---- RESULT ----
+    case STATE_RESULT:
+      if (stateChanged) {
+        displayResult(lastResultOk, resultMsg.c_str());
+      }
+      if (millis() - resultTime > RESULT_DISPLAY_MS) {
+        state = STATE_IDLE;
+        Serial.println("-> IDLE");
+      }
+      break;
 
-    if (!connected) {
-      oled.setCursor(0, 30);
-      oled.print("No encoder connected");
-    } else {
-      oled.setCursor(0, 26);
-      oled.print("Pos: ");
-      oled.setTextSize(2);
-      oled.print(pos);
-
-      oled.setTextSize(1);
-      oled.setCursor(0, 46);
-      oled.print("Knob: ");
-      oled.print(swPressed ? "PRESSED" : "---");
-    }
-
-    oled.setCursor(0, 57);
-    oled.print("Red btn to switch");
+    default:
+      break;
   }
 
-  oled.display();
-  delay(30);
+  delay(20);
 }
