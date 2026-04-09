@@ -4,3 +4,6 @@
 .vscode/launch.json
 .vscode/ipch
 src/secrets.h
+companion/.env
+companion/__pycache__/
+companion/venv/
