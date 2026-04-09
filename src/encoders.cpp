@@ -50,7 +50,7 @@ bool encoderSwitch(int i) {
 
 int encoderIndex(int i, int optionCount) {
   if (optionCount <= 0) return 0;
-  long pos = encPos[i];
+  long pos = encPos[i] / ENCODER_STEPS_PER_CLICK;
   int idx = (int)(pos % optionCount);
   if (idx < 0) idx += optionCount;
   return idx;

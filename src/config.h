@@ -18,6 +18,7 @@
 
 // -- Encoders --
 #define NUM_ENCODERS   5
+#define ENCODER_STEPS_PER_CLICK 4
 
 // -- Linear API --
 #define LINEAR_API_URL "https://api.linear.app/graphql"
