@@ -4,18 +4,21 @@
 
 | GPIO | Function   | Connected To                | Direction | Notes                           |
 |------|------------|-----------------------------|-----------|---------------------------------|
-| 21   | DISP_SDA   | I2C display SDA             | I/O       | Default I2C SDA, internal pullup|
-| 22   | DISP_SCL   | I2C display SCL             | Output    | Default I2C SCL, internal pullup|
+| 21   | TFT_MOSI   | SPI display data (DIN)      | Output    | Software SPI                    |
+| 22   | TFT_SCLK   | SPI display clock (CLK)     | Output    | Software SPI                    |
+| 5    | TFT_CS     | SPI display chip select     | Output    | Active LOW                      |
+| 2    | TFT_DC     | SPI display data/command    | Output    | Safe at boot (floats LOW)       |
+| 13   | TFT_RST    | SPI display reset           | Output    | Active LOW                      |
 ||
 | 4    | BUTTON     | Red push button             | Input     | Internal pullup, active LOW     |
 |
 | 16   | ENC1_A     | Encoder 1 — channel A (CLK) | Input     | Internal pullup, interrupt      |
 | 17   | ENC1_B     | Encoder 1 — channel B (DT)  | Input     | Internal pullup, interrupt      |
-| 5    | ENC1_SW    | Encoder 1 — push switch     | Input     | Internal pullup, active LOW     |
+| 35   | ENC1_SW    | Encoder 1 — push switch     | Input     | Input-only, external 10K pullup |
 |
 | 18   | ENC2_A     | Encoder 2 — channel A (CLK) | Input     | Internal pullup, interrupt      |
 | 19   | ENC2_B     | Encoder 2 — channel B (DT)  | Input     | Internal pullup, interrupt      |
-| 13   | ENC2_SW    | Encoder 2 — push switch     | Input     | Internal pullup, active LOW     |
+| 36   | ENC2_SW    | Encoder 2 — push switch     | Input     | Input-only, external 10K pullup |
 |
 | 25   | ENC3_A     | Encoder 3 — channel A (CLK) | Input     | Internal pullup, interrupt      |
 | 26   | ENC3_B     | Encoder 3 — channel B (DT)  | Input     | Internal pullup, interrupt      |
@@ -31,26 +34,30 @@
 
 ## Peripherals
 
-| Component          | Type                     | Interface  | Pins Used       |
-|--------------------|--------------------------|------------|-----------------|
-| I2C Display        | SSD1306 or similar OLED  | I2C        | 21, 22          |
-| Red Button         | Momentary push switch    | GPIO       | 4               |
-| Rotary Encoder 1   | EC11 (360° + push)       | GPIO + ISR | 16, 17, 5       |
-| Rotary Encoder 2   | EC11 (360° + push)       | GPIO + ISR | 18, 19, 13      |
-| Rotary Encoder 3   | EC11 (360° + push)       | GPIO + ISR | 25, 26, 27      |
-| Rotary Encoder 4   | EC11 (360° + push)       | GPIO + ISR | 32, 33, 23      |
-| Rotary Encoder 5   | EC11 (360° + push)       | GPIO + ISR | 14, 15, 34      |
+| Component          | Type                        | Interface | Pins Used       |
+|--------------------|-----------------------------|-----------|-----------------|
+| SPI Display        | Waveshare 2" ST7789 IPS LCD | SPI       | 21, 22, 5, 2, 13 |
+| Red Button         | Momentary push switch       | GPIO      | 4               |
+| Rotary Encoder 1   | EC11 (360° + push)          | GPIO + ISR | 16, 17, 35     |
+| Rotary Encoder 2   | EC11 (360° + push)          | GPIO + ISR | 18, 19, 36     |
+| Rotary Encoder 3   | EC11 (360° + push)          | GPIO + ISR | 25, 26, 27     |
+| Rotary Encoder 4   | EC11 (360° + push)          | GPIO + ISR | 32, 33, 23     |
+| Rotary Encoder 5   | EC11 (360° + push)          | GPIO + ISR | 14, 15, 34     |
 
 ## Wiring Reference
 
-### I2C Display (4-pin module)
+### SPI Display (Waveshare 2" LCD, 8-pin connector)
 
 | Display Pin | Connects To    |
 |-------------|----------------|
-| GND         | ESP32 GND      |
 | VCC         | ESP32 3.3V     |
-| SCL         | GPIO 22        |
-| SDA         | GPIO 21        |
+| GND         | ESP32 GND      |
+| DIN         | GPIO 21        |
+| CLK         | GPIO 22        |
+| CS          | GPIO 5         |
+| DC          | GPIO 2         |
+| RST         | GPIO 13        |
+| BL          | ESP32 3.3V     |
 
 ### Red Button (4-pin, two pins per side)
 
@@ -80,20 +87,21 @@ Each side pair is internally shorted. Wire one pin from each side:
 
 ## Pin Budget
 
-| Category         | Count |
-|------------------|-------|
-| I2C Display      | 2     |
-| Red Button       | 1     |
-| Encoders (5 × 3) | 15   |
-| **Total used**   | **18**|
-| Remaining safe   | 1 (GPIO 2 — on-board LED) |
-| Input-only spare | 3 (GPIOs 35, 36, 39 — no internal pullup) |
+| Category           | Count |
+|--------------------|-------|
+| SPI Display        | 5     |
+| Red Button         | 1     |
+| Encoders (5 × 3)  | 15    |
+| **Total used**     | **21**|
+| Remaining spare    | 0 safe GPIOs |
+| Input-only spare   | 1 (GPIO 39 — no internal pullup) |
 
 ## Notes
 
-- **GPIO 34** (ENC5_SW): input-only pin with no internal pullup — requires an external 10K resistor to 3.3V.
-- **GPIO 14**: outputs a brief PWM pulse during boot — no effect on encoder reading since the encoder is passive.
-- **GPIO 15**: outputs a brief PWM pulse during boot and controls boot debug logging — same as above, no issue for encoder input.
-- All encoder and button pins use `INPUT_PULLUP` so no external pull-up resistors are needed.
+- **GPIOs 34, 35, 36** (ENC5_SW, ENC1_SW, ENC2_SW): input-only pins with no internal pullup — each requires an external 10K resistor to 3.3V.
+- **GPIO 2** (TFT_DC): has weak internal pulldown, floats LOW at boot — safe for display DC line.
+- **GPIO 14**: outputs a brief PWM pulse during boot — no effect on encoder reading.
+- **GPIO 15**: outputs a brief PWM pulse during boot and controls boot debug logging — no issue for encoder input.
+- **BL (backlight)**: tied directly to 3.3V for always-on. Can be moved to a GPIO for brightness control if a pin becomes available.
 - All encoder A/B pins use interrupts on `CHANGE` for responsive rotation detection.
 - GND connections from all components can share a common ground rail.

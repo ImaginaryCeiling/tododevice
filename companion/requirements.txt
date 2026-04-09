@@ -1,0 +1,5 @@
+websockets
+sounddevice
+numpy
+deepgram-sdk
+python-dotenv
