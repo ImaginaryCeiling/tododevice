@@ -7,3 +7,6 @@ src/secrets.h
 companion/.env
 companion/__pycache__/
 companion/venv/
+
+.env.*
+.env
