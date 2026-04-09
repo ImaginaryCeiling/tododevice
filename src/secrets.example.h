@@ -3,6 +3,8 @@
 
 #pragma once
 
-#define WIFI_SSID      "your-wifi-ssid"
-#define WIFI_PASS      "your-wifi-password"
-#define LINEAR_API_KEY "lin_api_your_key_here"
+#define WIFI_SSID          "your-wifi-ssid"
+#define WIFI_PASS          "your-wifi-password"
+#define LINEAR_API_KEY     "lin_api_your_key_here"
+#define COMPANION_HOST     "192.168.1.100"
+#define COMPANION_PORT     8765
