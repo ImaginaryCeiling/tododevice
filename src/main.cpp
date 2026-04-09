@@ -5,6 +5,7 @@
 #include "display.h"
 #include "network.h"
 #include "linear.h"
+#include "companion_ws.h"
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -13,6 +14,7 @@
 enum AppState {
   STATE_BOOT,
   STATE_IDLE,
+  STATE_RECORDING,
   STATE_CONFIGURING,
   STATE_SUBMITTING,
   STATE_RESULT
@@ -26,6 +28,8 @@ static uint32_t      issueNum;
 static bool          lastResultOk;
 static String        resultMsg;
 static unsigned long resultTime;
+static String        issueTitle;
+static String        lastDisplayedTranscript;
 
 // ---------------------------------------------------------------------------
 // Priority lookup (hardcoded — Linear uses ints 0-4)
@@ -42,7 +46,9 @@ static const int   NUM_PRIOS    = 5;
 static bool          rawBtn       = HIGH;
 static bool          stableBtn    = HIGH;
 static unsigned long btnChangeAt  = 0;
-static bool          btnPressed   = false;
+static bool          btnPressed   = false;   // short-press released
+static bool          btnDown      = false;   // just pressed down
+static bool          btnUp        = false;   // just released
 static bool          btnLongPress = false;
 static unsigned long btnDownAt    = 0;
 static const unsigned long LONG_PRESS_MS = 2000;
@@ -50,6 +56,8 @@ static const unsigned long LONG_PRESS_MS = 2000;
 static void readButton() {
   btnPressed = false;
   btnLongPress = false;
+  btnDown = false;
+  btnUp = false;
   bool reading = digitalRead(BUTTON_PIN);
 
   if (reading != rawBtn) {
@@ -60,7 +68,9 @@ static void readButton() {
   if ((millis() - btnChangeAt) > DEBOUNCE_MS && rawBtn != stableBtn) {
     if (rawBtn == LOW) {
       btnDownAt = millis();
+      btnDown = true;
     } else {
+      btnUp = true;
       if ((millis() - btnDownAt) < LONG_PRESS_MS) {
         btnPressed = true;
       }
@@ -139,6 +149,9 @@ void setup() {
     linearData.states.size(), linearData.members.size(),
     linearData.projects.size(), linearData.labels.size());
 
+  // --- Companion WebSocket ---
+  companionSetup();
+
   // --- Issue counter (persisted in NVS) ---
   prefs.begin("tododevice", false);
   issueNum = prefs.getUInt("issueNum", 1);
@@ -153,6 +166,7 @@ void setup() {
 
 void loop() {
   readButton();
+  companionLoop();
 
   bool stateChanged = (state != prevState);
   prevState = state;
@@ -164,9 +178,12 @@ void loop() {
       if (stateChanged) {
         displayIdle(issueNum, linearData.teamName.c_str());
       }
-      if (btnPressed) {
-        state = STATE_CONFIGURING;
-        Serial.println("-> CONFIGURING");
+      if (btnDown) {
+        companionClearTranscript();
+        companionStartRecording();
+        lastDisplayedTranscript = "";
+        state = STATE_RECORDING;
+        Serial.println("-> RECORDING");
       }
       if (btnLongPress) {
         displayBoot("Refreshing", "Linear data...");
@@ -179,6 +196,27 @@ void loop() {
         displayIdle(issueNum, linearData.teamName.c_str());
       }
       break;
+
+    // ---- RECORDING ----
+    case STATE_RECORDING: {
+      if (stateChanged) {
+        displayRecordingBegin();
+      }
+
+      String t = companionGetTranscript();
+      if (t != lastDisplayedTranscript) {
+        displayRecordingText(t.c_str());
+        lastDisplayedTranscript = t;
+      }
+
+      if (btnUp) {
+        companionStopRecording();
+        issueTitle = t;
+        state = STATE_CONFIGURING;
+        Serial.println("-> CONFIGURING");
+      }
+      break;
+    }
 
     // ---- CONFIGURING ----
     case STATE_CONFIGURING: {
@@ -197,7 +235,14 @@ void loop() {
         resetPrevIdx();
       }
 
-      // Only redraw fields that changed
+      // Update transcript if a final arrives after we entered configuring
+      if (companionHasFinal()) {
+        String latest = companionGetTranscript();
+        if (latest.length() > 0) {
+          issueTitle = latest;
+        }
+      }
+
       const char* vals[5] = {
         linearData.states[idx[0]].name.c_str(),
         PRIO_NAMES[idx[1]],
@@ -216,9 +261,13 @@ void loop() {
       if (btnPressed) {
         displaySubmitting();
 
+        String title = issueTitle.length() > 0
+          ? issueTitle
+          : "Device Issue #" + String(issueNum);
+
         IssueParams p;
         p.teamId     = linearData.teamId;
-        p.title      = "Device Issue #" + String(issueNum);
+        p.title      = title;
         p.stateId    = linearData.states[idx[0]].id;
         p.priority   = PRIO_VALS[idx[1]];
         p.assigneeId = linearData.members[idx[2]].id;
@@ -238,6 +287,8 @@ void loop() {
           Serial.printf("Error: %s\n", res.error.c_str());
         }
 
+        issueTitle = "";
+        companionClearTranscript();
         resultTime = millis();
         state = STATE_RESULT;
         Serial.println("-> RESULT");
