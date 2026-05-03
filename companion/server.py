@@ -7,9 +7,11 @@ import logging
 import os
 import signal
 import sys
+import time
 
 import sounddevice as sd
 import websockets
+from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,6 +26,7 @@ CHUNK_SAMPLES = int(SAMPLE_RATE * 0.1)  # 100ms chunks
 
 WS_HOST = "0.0.0.0"
 WS_PORT = 8765
+UI_PORT = 8090
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +34,60 @@ logging.basicConfig(
 )
 log = logging.getLogger("companion")
 
+
+# ---------------------------------------------------------------------------
+# UI Broadcaster — pushes live events to all connected dashboard clients
+# ---------------------------------------------------------------------------
+
+class UIBroadcaster:
+    def __init__(self):
+        self._clients: set[web.WebSocketResponse] = set()
+        self._event_log: list[dict] = []
+        self.state = {
+            "esp_connected": False,
+            "esp_addr": None,
+            "recording": False,
+            "transcript": "",
+            "last_final": "",
+        }
+
+    async def add(self, ws: web.WebSocketResponse):
+        self._clients.add(ws)
+        await ws.send_json({
+            "type": "init",
+            "state": self.state,
+            "log": self._event_log[-50:],
+        })
+
+    def remove(self, ws: web.WebSocketResponse):
+        self._clients.discard(ws)
+
+    async def emit(self, event_type: str, data: dict | None = None):
+        entry = {
+            "type": event_type,
+            "ts": time.time(),
+            **(data or {}),
+        }
+        self._event_log.append(entry)
+        if len(self._event_log) > 200:
+            self._event_log = self._event_log[-100:]
+
+        dead = []
+        for ws in self._clients:
+            try:
+                await ws.send_json(entry)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self._clients.discard(ws)
+
+
+ui = UIBroadcaster()
+
+
+# ---------------------------------------------------------------------------
+# Transcription session
+# ---------------------------------------------------------------------------
 
 class TranscriptionSession:
     """Manages mic capture → Deepgram streaming → transcript relay for one recording."""
@@ -81,6 +138,10 @@ class TranscriptionSession:
         )
         self.mic_stream.start()
         log.info("Mic capture started")
+
+        ui.state["recording"] = True
+        ui.state["transcript"] = ""
+        await ui.emit("recording_start")
 
         self._tasks = [
             asyncio.create_task(self._send_audio_loop()),
@@ -150,7 +211,10 @@ class TranscriptionSession:
                     sep = " " if self.confirmed_text else ""
                     display = self.confirmed_text + sep + transcript
 
-                await self._relay({"type": "partial", "text": display.strip()})
+                text = display.strip()
+                await self._relay({"type": "partial", "text": text})
+                ui.state["transcript"] = text
+                await ui.emit("transcript", {"text": text, "is_final": is_final})
 
         except websockets.exceptions.ConnectionClosed as e:
             log.info("Deepgram connection closed: %s", e)
@@ -199,6 +263,11 @@ class TranscriptionSession:
         await self._relay({"type": "final", "text": final})
         log.info("Final transcript: %s", final if final else "(empty)")
 
+        ui.state["recording"] = False
+        ui.state["last_final"] = final
+        ui.state["transcript"] = ""
+        await ui.emit("recording_stop", {"text": final})
+
     async def _relay(self, payload: dict):
         if self.esp_ws is None:
             tag = "FINAL" if payload.get("type") == "final" else "     "
@@ -210,10 +279,18 @@ class TranscriptionSession:
             log.warning("ESP32 disconnected, cannot relay message")
 
 
+# ---------------------------------------------------------------------------
+# ESP32 WebSocket handler
+# ---------------------------------------------------------------------------
+
 async def handle_client(websocket):
     addr = websocket.remote_address
     log.info("Client connected: %s", addr)
     session = None
+
+    ui.state["esp_connected"] = True
+    ui.state["esp_addr"] = f"{addr[0]}:{addr[1]}"
+    await ui.emit("esp_connect", {"addr": ui.state["esp_addr"]})
 
     try:
         async for raw in websocket:
@@ -257,7 +334,219 @@ async def handle_client(websocket):
     finally:
         if session:
             await session.stop()
+        ui.state["esp_connected"] = False
+        ui.state["esp_addr"] = None
+        await ui.emit("esp_disconnect")
 
+
+# ---------------------------------------------------------------------------
+# Dashboard HTTP + WebSocket (aiohttp)
+# ---------------------------------------------------------------------------
+
+DASHBOARD_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Companion Dashboard</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+       background:#0d1117;color:#c9d1d9;min-height:100vh;padding:24px}
+  h1{font-size:1.4rem;font-weight:600;color:#f0f6fc;margin-bottom:4px}
+  .subtitle{font-size:.85rem;color:#8b949e;margin-bottom:24px}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+  @media(max-width:640px){.grid{grid-template-columns:1fr}}
+
+  .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px}
+  .card h2{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin-bottom:8px}
+  .card .value{font-size:1.5rem;font-weight:600}
+
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px;vertical-align:middle}
+  .dot.on{background:#3fb950;box-shadow:0 0 8px #3fb95066}
+  .dot.off{background:#484f58}
+
+  .transcript-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}
+  .transcript-box h2{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin-bottom:12px}
+  .transcript-text{font-size:1.25rem;line-height:1.6;min-height:60px;color:#f0f6fc;
+                    transition:opacity .15s}
+  .transcript-text.dim{color:#8b949e;font-style:italic}
+
+  .log-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px}
+  .log-box h2{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin-bottom:12px}
+  .log-list{list-style:none;max-height:320px;overflow-y:auto;font-family:"SF Mono",SFMono-Regular,Menlo,monospace;font-size:.8rem;line-height:1.7}
+  .log-list li{border-bottom:1px solid #21262d;padding:4px 0;display:flex;gap:10px}
+  .log-list .ts{color:#484f58;flex-shrink:0}
+  .log-list .ev{color:#58a6ff}
+  .log-list .detail{color:#8b949e}
+
+  .recording-pulse{animation:pulse 1.5s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+</style>
+</head>
+<body>
+  <h1>Companion Dashboard</h1>
+  <p class="subtitle">Real-time view of the todo device companion server</p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Device</h2>
+      <div class="value"><span class="dot off" id="esp-dot"></span><span id="esp-status">Disconnected</span></div>
+      <div style="margin-top:6px;font-size:.8rem;color:#8b949e" id="esp-addr"></div>
+    </div>
+    <div class="card">
+      <h2>Recording</h2>
+      <div class="value"><span class="dot off" id="rec-dot"></span><span id="rec-status">Idle</span></div>
+    </div>
+  </div>
+
+  <div class="transcript-box">
+    <h2>Live Transcript</h2>
+    <div class="transcript-text dim" id="transcript">Waiting for recording...</div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px" id="final-card">
+    <h2>Last Completed Task</h2>
+    <div class="value" style="font-size:1.1rem" id="last-final">—</div>
+  </div>
+
+  <div class="log-box">
+    <h2>Event Log</h2>
+    <ul class="log-list" id="log-list"></ul>
+  </div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+
+function addLog(type, detail, ts) {
+  const li = document.createElement('li');
+  li.innerHTML = `<span class="ts">${fmtTime(ts || Date.now()/1000)}</span>`
+               + `<span class="ev">${type}</span>`
+               + (detail ? `<span class="detail">${detail}</span>` : '');
+  const list = $('log-list');
+  list.prepend(li);
+  while (list.children.length > 100) list.lastChild.remove();
+}
+
+function applyState(s) {
+  const espDot = $('esp-dot'), espSt = $('esp-status'), espAddr = $('esp-addr');
+  if (s.esp_connected) {
+    espDot.className = 'dot on';
+    espSt.textContent = 'Connected';
+    espAddr.textContent = s.esp_addr || '';
+  } else {
+    espDot.className = 'dot off';
+    espSt.textContent = 'Disconnected';
+    espAddr.textContent = '';
+  }
+
+  const recDot = $('rec-dot'), recSt = $('rec-status');
+  if (s.recording) {
+    recDot.className = 'dot on recording-pulse';
+    recSt.textContent = 'Recording';
+  } else {
+    recDot.className = 'dot off';
+    recSt.textContent = 'Idle';
+  }
+
+  const tx = $('transcript');
+  if (s.transcript) {
+    tx.textContent = s.transcript;
+    tx.className = 'transcript-text';
+  } else {
+    tx.textContent = s.recording ? 'Listening...' : 'Waiting for recording...';
+    tx.className = 'transcript-text dim';
+  }
+
+  if (s.last_final) {
+    $('last-final').textContent = s.last_final;
+  }
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => addLog('ui', 'Dashboard connected');
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === 'init') {
+      applyState(msg.state);
+      (msg.log || []).reverse().forEach(ev => addLog(ev.type, ev.text || ev.addr || '', ev.ts));
+      return;
+    }
+
+    if (msg.type === 'esp_connect') {
+      $('esp-dot').className = 'dot on';
+      $('esp-status').textContent = 'Connected';
+      $('esp-addr').textContent = msg.addr || '';
+      addLog('esp_connect', msg.addr, msg.ts);
+    } else if (msg.type === 'esp_disconnect') {
+      $('esp-dot').className = 'dot off';
+      $('esp-status').textContent = 'Disconnected';
+      $('esp-addr').textContent = '';
+      addLog('esp_disconnect', '', msg.ts);
+    } else if (msg.type === 'recording_start') {
+      $('rec-dot').className = 'dot on recording-pulse';
+      $('rec-status').textContent = 'Recording';
+      $('transcript').textContent = 'Listening...';
+      $('transcript').className = 'transcript-text dim';
+      addLog('recording_start', '', msg.ts);
+    } else if (msg.type === 'recording_stop') {
+      $('rec-dot').className = 'dot off';
+      $('rec-status').textContent = 'Idle';
+      $('transcript').textContent = 'Waiting for recording...';
+      $('transcript').className = 'transcript-text dim';
+      if (msg.text) $('last-final').textContent = msg.text;
+      addLog('recording_stop', msg.text, msg.ts);
+    } else if (msg.type === 'transcript') {
+      const tx = $('transcript');
+      tx.textContent = msg.text;
+      tx.className = 'transcript-text';
+    }
+  };
+
+  ws.onclose = () => {
+    addLog('ui', 'Connection lost — reconnecting...');
+    setTimeout(connect, 2000);
+  };
+}
+
+connect();
+</script>
+</body>
+</html>
+"""
+
+
+async def dashboard_handler(request):
+    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+
+async def dashboard_ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    await ui.add(ws)
+    try:
+        async for _msg in ws:
+            pass
+    finally:
+        ui.remove(ws)
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Entrypoints
+# ---------------------------------------------------------------------------
 
 def _check_api_key():
     if not DEEPGRAM_API_KEY or DEEPGRAM_API_KEY == "your-deepgram-api-key-here":
@@ -286,10 +575,11 @@ async def run_test():
 
 
 async def run_server():
-    """Run the WebSocket server for ESP32 clients."""
+    """Run the WebSocket server for ESP32 clients + the dashboard UI."""
     _check_api_key()
 
     log.info("Starting companion server on ws://%s:%d", WS_HOST, WS_PORT)
+    log.info("Dashboard UI at http://%s:%d", WS_HOST, UI_PORT)
 
     stop_event = asyncio.get_event_loop().create_future()
 
@@ -297,10 +587,19 @@ async def run_server():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set_result, None)
 
+    app = web.Application()
+    app.router.add_get("/", dashboard_handler)
+    app.router.add_get("/ws", dashboard_ws_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, WS_HOST, UI_PORT)
+    await site.start()
+
     async with websockets.serve(handle_client, WS_HOST, WS_PORT):
         log.info("Server ready — waiting for connections...")
         await stop_event
 
+    await runner.cleanup()
     log.info("Server shut down")
 
 
@@ -318,6 +617,12 @@ if __name__ == "__main__":
         help=f"WebSocket server port (default: {WS_PORT})",
     )
     parser.add_argument(
+        "--ui-port",
+        type=int,
+        default=UI_PORT,
+        help=f"Dashboard UI port (default: {UI_PORT})",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -328,6 +633,7 @@ if __name__ == "__main__":
         logging.getLogger().setLevel(logging.DEBUG)
 
     WS_PORT = args.port
+    UI_PORT = args.ui_port
 
     if args.test:
         asyncio.run(run_test())
