@@ -63,7 +63,13 @@ class TranscriptionSession:
         headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
         log.info("Connecting to Deepgram...")
-        self.dg_ws = await websockets.connect(url, additional_headers=headers)
+        log.debug("Deepgram URL: %s", url)
+        log.debug("Auth header: Token %s...%s", DEEPGRAM_API_KEY[:4], DEEPGRAM_API_KEY[-4:])
+        try:
+            self.dg_ws = await websockets.connect(url, additional_headers=headers)
+        except Exception as e:
+            log.error("Deepgram connection failed: %s", e)
+            raise
         log.info("Deepgram connected")
 
         self.mic_stream = sd.InputStream(
@@ -92,24 +98,36 @@ class TranscriptionSession:
 
     async def _send_audio_loop(self):
         """Drain the audio queue and forward chunks to Deepgram."""
+        chunks_sent = 0
         try:
             while self.running:
                 try:
                     data = await asyncio.wait_for(self.audio_queue.get(), timeout=0.5)
                     await self.dg_ws.send(data)
+                    chunks_sent += 1
+                    if chunks_sent % 50 == 0:
+                        log.debug("Audio chunks sent: %d (%d bytes each, queue: %d)",
+                                  chunks_sent, len(data), self.audio_queue.qsize())
                 except asyncio.TimeoutError:
                     continue
-        except websockets.exceptions.ConnectionClosed:
-            log.warning("Deepgram WS closed while sending audio")
+        except websockets.exceptions.ConnectionClosed as e:
+            log.warning("Deepgram WS closed while sending audio: %s", e)
         except Exception:
             log.exception("Error in audio send loop")
+        log.debug("Audio send loop exited after %d chunks", chunks_sent)
 
     async def _receive_transcripts_loop(self):
         """Read transcript messages from Deepgram and forward to the ESP32."""
+        msg_count = 0
         try:
             async for raw_msg in self.dg_ws:
                 msg = json.loads(raw_msg)
-                if msg.get("type") != "Results":
+                msg_type = msg.get("type", "unknown")
+                msg_count += 1
+                log.debug("Deepgram msg #%d [%s]: %s", msg_count, msg_type,
+                          json.dumps(msg)[:200])
+
+                if msg_type != "Results":
                     continue
 
                 transcript = (
@@ -117,25 +135,28 @@ class TranscriptionSession:
                     .get("alternatives", [{}])[0]
                     .get("transcript", "")
                 )
-                if not transcript:
-                    continue
-
                 is_final = msg.get("is_final", False)
+
+                if not transcript:
+                    log.debug("Empty transcript (is_final=%s), skipping", is_final)
+                    continue
 
                 if is_final:
                     sep = " " if self.confirmed_text else ""
                     self.confirmed_text += sep + transcript
                     display = self.confirmed_text
+                    log.debug("is_final transcript: %r -> confirmed: %r", transcript, self.confirmed_text)
                 else:
                     sep = " " if self.confirmed_text else ""
                     display = self.confirmed_text + sep + transcript
 
                 await self._relay({"type": "partial", "text": display.strip()})
 
-        except websockets.exceptions.ConnectionClosed:
-            log.info("Deepgram connection closed")
+        except websockets.exceptions.ConnectionClosed as e:
+            log.info("Deepgram connection closed: %s", e)
         except Exception:
             log.exception("Error in transcript receive loop")
+        log.debug("Receive loop exited after %d messages", msg_count)
 
     async def stop(self):
         self.running = False
@@ -148,15 +169,19 @@ class TranscriptionSession:
 
         if self.dg_ws:
             try:
+                log.debug("Sending Finalize to Deepgram")
                 await self.dg_ws.send(json.dumps({"type": "Finalize"}))
                 await asyncio.sleep(0.8)
-            except Exception:
-                pass
+                log.debug("Finalize sent, waited 0.8s")
+            except Exception as e:
+                log.debug("Finalize send failed: %s", e)
             try:
+                log.debug("Sending CloseStream to Deepgram")
                 await self.dg_ws.send(json.dumps({"type": "CloseStream"}))
                 await asyncio.sleep(0.3)
-            except Exception:
-                pass
+                log.debug("CloseStream sent, waited 0.3s")
+            except Exception as e:
+                log.debug("CloseStream send failed: %s", e)
 
         for t in self._tasks:
             t.cancel()
@@ -292,7 +317,15 @@ if __name__ == "__main__":
         default=WS_PORT,
         help=f"WebSocket server port (default: {WS_PORT})",
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable debug logging",
+    )
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     WS_PORT = args.port
 
