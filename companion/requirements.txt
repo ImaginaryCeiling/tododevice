@@ -3,3 +3,4 @@ sounddevice
 numpy
 deepgram-sdk
 python-dotenv
+aiohttp
